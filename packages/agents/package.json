@@ -68,6 +68,11 @@
       "types": "./dist/schedule.d.ts",
       "import": "./dist/schedule.js",
       "require": "./dist/schedule.js"
+    },
+    "./observability": {
+      "types": "./dist/observability/index.d.ts",
+      "require": "./dist/observability/index.js",
+      "import": "./dist/observability/index.js"
     }
   },
   "files": [

@@ -76,7 +76,22 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
           },
           [connection.id]
         );
+
+        const incomingMessages = this._messagesNotAlreadyInAgent(messages);
         await this.persistMessages(messages, [connection.id]);
+
+        this.observability?.emit(
+          {
+            type: "message:request",
+            id: data.id,
+            displayMessage: "Chat message request",
+            timestamp: Date.now(),
+            payload: {
+              message: incomingMessages,
+            },
+          },
+          this.ctx
+        );
 
         const chatMessageId = data.id;
         const abortSignal = this._getAbortSignal(chatMessageId);
@@ -89,8 +104,23 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
                 responseMessages: response.messages,
               });
 
+              const outgoingMessages =
+                this._messagesNotAlreadyInAgent(finalMessages);
               await this.persistMessages(finalMessages, [connection.id]);
               this._removeAbortController(chatMessageId);
+
+              this.observability?.emit(
+                {
+                  type: "message:response",
+                  id: data.id,
+                  displayMessage: "Chat message response",
+                  timestamp: Date.now(),
+                  payload: {
+                    message: outgoingMessages,
+                  },
+                },
+                this.ctx
+              );
             },
             abortSignal ? { abortSignal } : undefined
           );
@@ -217,6 +247,11 @@ export class AIChatAgent<Env = unknown, State = unknown> extends Agent<
       },
       excludeBroadcastIds
     );
+  }
+
+  private _messagesNotAlreadyInAgent(messages: ChatMessage[]) {
+    const existingIds = new Set(this.messages.map((message) => message.id));
+    return messages.filter((message) => !existingIds.has(message.id));
   }
 
   private async _reply(id: string, response: Response) {

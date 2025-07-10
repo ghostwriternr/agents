@@ -23,7 +23,7 @@ import { camelCaseToKebabCase } from "./client";
 import { MCPClientManager } from "./mcp/client";
 // import type { MCPClientConnection } from "./mcp/client-connection";
 import { DurableObjectOAuthClientProvider } from "./mcp/do-oauth-client-provider";
-import { genericObservability, type Observability } from "./observability";
+import { genericObservability, type Observability, WebSocketDebugObservability } from "./observability";
 
 export type { Connection, ConnectionContext, WSMessage } from "partyserver";
 
@@ -52,21 +52,21 @@ export type RPCResponse = {
   type: "rpc";
   id: string;
 } & (
-  | {
+    | {
       success: true;
       result: unknown;
       done?: false;
     }
-  | {
+    | {
       success: true;
       result: unknown;
       done: true;
     }
-  | {
+    | {
       success: false;
       error: string;
     }
-);
+  );
 
 /**
  * Type guard for RPC request messages
@@ -141,13 +141,13 @@ export type Schedule<T = string> = {
   /** Data to be passed to the callback */
   payload: T;
 } & (
-  | {
+    | {
       /** Type of schedule for one-time execution at a specific time */
       type: "scheduled";
       /** Timestamp when the task should execute */
       time: number;
     }
-  | {
+    | {
       /** Type of schedule for delayed execution */
       type: "delayed";
       /** Timestamp when the task should execute */
@@ -155,7 +155,7 @@ export type Schedule<T = string> = {
       /** Number of seconds to delay execution */
       delayInSeconds: number;
     }
-  | {
+    | {
       /** Type of schedule for recurring execution based on cron expression */
       type: "cron";
       /** Timestamp for the next execution */
@@ -163,7 +163,7 @@ export type Schedule<T = string> = {
       /** Cron expression defining the schedule */
       cron: string;
     }
-);
+  );
 
 function getNextCronTime(cron: string) {
   const interval = parseCronExpression(cron);
@@ -232,10 +232,10 @@ export function getCurrentAgent<
 } {
   const store = agentContext.getStore() as
     | {
-        agent: T;
-        connection: Connection | undefined;
-        request: Request<unknown, CfProperties<unknown>> | undefined;
-      }
+      agent: T;
+      connection: Connection | undefined;
+      request: Request<unknown, CfProperties<unknown>> | undefined;
+    }
     | undefined;
   if (!store) {
     return {
@@ -345,11 +345,25 @@ export class Agent<Env, State = unknown> extends Server<Env> {
       return [...this.ctx.storage.sql.exec(query, ...values)] as T[];
     } catch (e) {
       console.error(`failed to execute sql query: ${query}`, e);
+      this.observability?.emit(
+        {
+          id: nanoid(),
+          type: "error",
+          displayMessage: `SQL query failed: ${e instanceof Error ? e.message : 'Unknown error'}`,
+          timestamp: Date.now(),
+          payload: {
+            error: e instanceof Error ? e : new Error(String(e)),
+            context: "sql_query",
+          },
+        },
+        this.ctx
+      );
       throw this.onError(e);
     }
   }
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
+    this.observability = new WebSocketDebugObservability(this);
 
     this.sql`
       CREATE TABLE IF NOT EXISTS cf_agents_state (
@@ -441,6 +455,14 @@ export class Agent<Env, State = unknown> extends Server<Env> {
             return;
           }
 
+          // Handle debug messages
+          if (parsed && typeof parsed === 'object' && 'type' in parsed &&
+            typeof parsed.type === 'string' && parsed.type.startsWith('debug:') &&
+            this.observability?.handleDebugMessage) {
+            this.observability.handleDebugMessage(connection, message);
+            return;
+          }
+
           if (isRPCRequest(parsed)) {
             try {
               const { id, method, args } = parsed;
@@ -502,6 +524,21 @@ export class Agent<Env, State = unknown> extends Server<Env> {
               };
               connection.send(JSON.stringify(response));
               console.error("RPC error:", e);
+
+              this.observability?.emit(
+                {
+                  id: nanoid(),
+                  type: "error",
+                  displayMessage: `RPC call failed: ${parsed.method}`,
+                  timestamp: Date.now(),
+                  payload: {
+                    error: e instanceof Error ? e : new Error(String(e)),
+                    context: "rpc_call",
+                    connectionId: connection.id,
+                  },
+                },
+                this.ctx
+              );
             }
             return;
           }
@@ -513,6 +550,17 @@ export class Agent<Env, State = unknown> extends Server<Env> {
 
     const _onConnect = this.onConnect.bind(this);
     this.onConnect = (connection: Connection, ctx: ConnectionContext) => {
+      // Check if this is a debug connection
+      const url = new URL(ctx.request.url);
+      if (url.searchParams.get('mode') === 'debug' && this.observability?.handleDebugConnection) {
+        return agentContext.run(
+          { agent: this, connection, request: ctx.request },
+          async () => {
+            this.observability?.handleDebugConnection?.(connection);
+          }
+        );
+      }
+
       // TODO: This is a hack to ensure the state is sent after the connection is established
       // must fix this
       return agentContext.run(
@@ -684,12 +732,17 @@ export class Agent<Env, State = unknown> extends Server<Env> {
   override onError(error: unknown): void | Promise<void>;
   override onError(connectionOrError: Connection | unknown, error?: unknown) {
     let theError: unknown;
+    let connectionId: string | undefined;
+    let errorContext: string;
+
     if (connectionOrError && error) {
       theError = error;
+      connectionId = (connectionOrError as Connection).id;
+      errorContext = "websocket_connection";
       // this is a websocket connection error
       console.error(
         "Error on websocket connection:",
-        (connectionOrError as Connection).id,
+        connectionId,
         theError
       );
       console.error(
@@ -697,10 +750,28 @@ export class Agent<Env, State = unknown> extends Server<Env> {
       );
     } else {
       theError = connectionOrError;
+      errorContext = "server";
       // this is a server error
       console.error("Error on server:", theError);
       console.error("Override onError(error) to handle server errors");
     }
+
+    // Emit error event
+    this.observability?.emit(
+      {
+        id: nanoid(),
+        type: "error",
+        displayMessage: `${errorContext === "websocket_connection" ? "WebSocket" : "Server"} error: ${theError instanceof Error ? theError.message : String(theError)}`,
+        timestamp: Date.now(),
+        payload: {
+          error: theError instanceof Error ? theError : new Error(String(theError)),
+          context: errorContext,
+          connectionId,
+        },
+      },
+      this.ctx
+    );
+
     throw theError;
   }
 
@@ -751,8 +822,8 @@ export class Agent<Env, State = unknown> extends Server<Env> {
       this.sql`
         INSERT OR REPLACE INTO cf_agents_schedules (id, callback, payload, type, time)
         VALUES (${id}, ${callback}, ${JSON.stringify(
-          payload
-        )}, 'scheduled', ${timestamp})
+        payload
+      )}, 'scheduled', ${timestamp})
       `;
 
       await this._scheduleNextAlarm();
@@ -776,8 +847,8 @@ export class Agent<Env, State = unknown> extends Server<Env> {
       this.sql`
         INSERT OR REPLACE INTO cf_agents_schedules (id, callback, payload, type, delayInSeconds, time)
         VALUES (${id}, ${callback}, ${JSON.stringify(
-          payload
-        )}, 'delayed', ${when}, ${timestamp})
+        payload
+      )}, 'delayed', ${when}, ${timestamp})
       `;
 
       await this._scheduleNextAlarm();
@@ -802,8 +873,8 @@ export class Agent<Env, State = unknown> extends Server<Env> {
       this.sql`
         INSERT OR REPLACE INTO cf_agents_schedules (id, callback, payload, type, cron, time)
         VALUES (${id}, ${callback}, ${JSON.stringify(
-          payload
-        )}, 'cron', ${when}, ${timestamp})
+        payload
+      )}, 'cron', ${when}, ${timestamp})
       `;
 
       await this._scheduleNextAlarm();
@@ -917,9 +988,9 @@ export class Agent<Env, State = unknown> extends Server<Env> {
   private async _scheduleNextAlarm() {
     // Find the next schedule that needs to be executed
     const result = this.sql`
-      SELECT time FROM cf_agents_schedules 
+      SELECT time FROM cf_agents_schedules
       WHERE time > ${Math.floor(Date.now() / 1000)}
-      ORDER BY time ASC 
+      ORDER BY time ASC
       LIMIT 1
     `;
     if (!result) return;
@@ -975,6 +1046,19 @@ export class Agent<Env, State = unknown> extends Server<Env> {
             ).bind(this)(JSON.parse(row.payload as string), row);
           } catch (e) {
             console.error(`error executing callback "${row.callback}"`, e);
+            this.observability?.emit(
+              {
+                id: nanoid(),
+                type: "error",
+                displayMessage: `Schedule callback failed: ${row.callback}`,
+                timestamp: Date.now(),
+                payload: {
+                  error: e instanceof Error ? e : new Error(String(e)),
+                  context: "schedule_execute",
+                },
+              },
+              this.ctx
+            );
           }
         }
       );
@@ -1238,11 +1322,11 @@ export async function routeAgentRequest<Env>(
   const corsHeaders =
     options?.cors === true
       ? {
-          "Access-Control-Allow-Credentials": "true",
-          "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Max-Age": "86400",
-        }
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Max-Age": "86400",
+      }
       : options?.cors;
 
   if (request.method === "OPTIONS") {
@@ -1291,7 +1375,7 @@ export async function routeAgentEmail<Env>(
   _email: ForwardableEmailMessage,
   _env: Env,
   _options?: AgentOptions<Env>
-): Promise<void> {}
+): Promise<void> { }
 
 /**
  * Get or create an Agent by name
@@ -1363,3 +1447,8 @@ export class StreamingResponse {
     this._connection.send(JSON.stringify(response));
   }
 }
+
+// Export debug-related functionality
+export { AgentDebugger, createAgentDebugger } from "./debug-client";
+export type { AgentDebuggerOptions, DebugEventData, DebugHistoryData, DebugInitData, DebugStateData } from "./debug-client";
+

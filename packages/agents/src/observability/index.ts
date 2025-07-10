@@ -1,4 +1,5 @@
 import type { Message } from "ai";
+import type { Connection } from "partyserver";
 import type { Schedule } from "../index";
 import { getCurrentAgent } from "../index";
 
@@ -64,6 +65,14 @@ export type ObservabilityEvent =
       {
         connectionId: string;
       }
+    >
+  | BaseEvent<
+      "error",
+      {
+        error: Error;
+        context: string;
+        connectionId?: string;
+      }
     >;
 
 export interface Observability {
@@ -73,6 +82,25 @@ export interface Observability {
    * @param ctx - The execution context of the invocation
    */
   emit(event: ObservabilityEvent, ctx: DurableObjectState): void;
+
+  /**
+   * Handle a debug connection (optional)
+   * @param connection - The WebSocket connection from a debug client
+   */
+  handleDebugConnection?(connection: Connection): void;
+
+  /**
+   * Handle messages from debug clients (optional)
+   * @param connection - The WebSocket connection from a debug client
+   * @param message - The message received
+   */
+  handleDebugMessage?(connection: Connection, message: unknown): void;
+
+  /**
+   * Remove a debug connection (optional)
+   * @param connection - The WebSocket connection to remove
+   */
+  removeDebugConnection?(connection: Connection): void;
 }
 
 /**
@@ -90,18 +118,20 @@ export const genericObservability: Observability = {
   },
 };
 
-let localMode = false;
-
 function isLocalMode() {
-  if (localMode) {
-    return true;
-  }
-  const { request } = getCurrentAgent();
-  if (!request) {
+  try {
+    const agent = getCurrentAgent();
+    if (!agent?.request) {
+      return false;
+    }
+
+    const url = new URL(agent.request.url);
+    return url.hostname === "localhost";
+  } catch {
+    // If we're outside of AsyncLocalStorage context, assume not local mode
     return false;
   }
-
-  const url = new URL(request.url);
-  localMode = url.hostname === "localhost";
-  return localMode;
 }
+
+export { WebSocketDebugObservability } from "./websocket-debug";
+export type { WebSocketDebugOptions } from "./websocket-debug";

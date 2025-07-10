@@ -12,6 +12,7 @@ async function main() {
       "src/mcp/client.ts",
       "src/mcp/do-oauth-client-provider.ts",
       "src/observability/index.ts",
+      "src/observability/websocket-debug.ts",
     ],
     external: [
       "cloudflare:workers",
